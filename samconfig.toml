@@ -1,0 +1,8 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "exr-mcp"
+resolve_s3 = true
+s3_prefix = "exr-mcp"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
