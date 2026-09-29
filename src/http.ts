@@ -3,11 +3,16 @@ import { rateLimit } from "express-rate-limit";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import type { WorkoutArchive } from "./archive.js";
 import { ExrClient, type RememberCookie } from "./exr.js";
 import { ExrSignInProvider, LOGIN_PATH } from "./oauth.js";
 import { createMcpServer } from "./server.js";
 
 export type HttpConfig = {
+  // The archive of workouts removed from EXR, for the given person's EXR email
+  archive: (email: string) => WorkoutArchive;
+  // How long archived workouts can be restored; the S3 lifecycle rule purges them after that
+  archiveDays: number;
   allowedEmails: string[];
   signingSecret: string;
   redirectUris: string[];
@@ -108,8 +113,9 @@ function createRoutes(config: HttpConfig, origin: string): express.Router {
   router.post("/mcp", requireAuth, express.json({ limit: "1mb" }), async (req, res) => {
     // Each request acts for whoever signed in, with the EXR cookie their token carries
     const client = new ExrClient(req.auth?.extra?.exrRemember as RememberCookie);
+    const archive = config.archive(String(req.auth?.extra?.email));
     // Stateless: a fresh server and transport per request, so any Lambda instance can serve any call
-    const server = createMcpServer(client);
+    const server = createMcpServer(client, archive, config.archiveDays);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on("close", () => {
       transport.close();

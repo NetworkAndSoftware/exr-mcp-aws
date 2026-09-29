@@ -14,6 +14,7 @@
     "deploy": "npm run build:lambda && sam deploy"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1142.0",
     "@modelcontextprotocol/sdk": "^1.30.1",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",

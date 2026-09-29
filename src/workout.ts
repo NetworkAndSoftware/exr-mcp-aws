@@ -116,7 +116,7 @@ export function convertSteps(steps: Step[], { ftpWatts }: { ftpWatts?: number } 
 export function workoutFile(title: string, description: string, { unit, blocks }: Conversion): ExrWorkoutFile {
   const data = { category: "Custom Workouts", title, unitType: UNIT_TYPES[unit], description, schedule: blocks, events: [] };
   return {
-    metaData: { fileVersionNumber: 2, guid: randomUUID() },
+    metaData: { fileVersionNumber: 2, guid: markedGuid() },
     data,
     editorData: { eventLinks: [] },
     // EXR's own checksum algorithm is unknown. Its website only requires a non-empty value.
@@ -125,6 +125,21 @@ export function workoutFile(title: string, description: string, { unit, blocks }
     _id: 1,
   };
 }
+
+// Workouts created here carry a mark in metaData.guid: a random UUID whose last 12 hex digits are
+// derived from the rest. EXR keeps the guid as uploaded, so removal can be limited to workouts
+// created here, without storing anything. Other GUIDs match by chance with odds of 1 in 2^48.
+export function isCreatedHere(file: ExrWorkoutFile): boolean {
+  const guid = file.metaData?.guid;
+  return typeof guid === "string" && guid.length === 36 && guid.slice(24) === guidMark(guid.slice(0, 24));
+}
+
+function markedGuid(): string {
+  const head = randomUUID().slice(0, 24);
+  return head + guidMark(head);
+}
+
+const guidMark = (head: string) => createHash("sha256").update(`exr-mcp:${head}`).digest("hex").slice(0, 12);
 
 // A readable summary of a workout, with one line per block
 export function describeWorkout({ title, description, unitType, schedule }: ExrWorkoutFile["data"]) {

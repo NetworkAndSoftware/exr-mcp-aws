@@ -12,8 +12,33 @@ Parameters:
     Type: String
     Default: https://claude.ai/api/mcp/auth_callback
     Description: Comma-separated OAuth redirect URIs that clients may register
+  ArchiveDays:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Days a workout removed with archive_workouts can be restored, before S3 purges its copy
 
 Resources:
+  # Copies of workouts removed from EXR, so removals can be undone
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    # Archived workouts outlive the stack; empty and delete the bucket by hand
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # The only way archived workouts are purged; the function can't delete them
+          - Id: PurgeArchivedWorkouts
+            Status: Enabled
+            Prefix: archive/
+            ExpirationInDays: !Ref ArchiveDays
+
   McpFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -29,6 +54,8 @@ Resources:
         Variables:
           SSM_PREFIX: !Ref SsmPrefix
           OAUTH_REDIRECT_URIS: !Ref RedirectUris
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          ARCHIVE_DAYS: !Ref ArchiveDays
           NODE_ENV: production
           NODE_OPTIONS: --enable-source-maps
       # Public URL; every route except OAuth discovery and the sign-in page requires a token.
@@ -42,6 +69,13 @@ Resources:
             - Effect: Allow
               Action: ssm:GetParameters
               Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*
+            # Write and read archived workouts, but not delete them
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: !Sub ${ArchiveBucket.Arn}/archive/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt ArchiveBucket.Arn
 
   McpLogGroup:
     Type: AWS::Logs::LogGroup
@@ -53,3 +87,6 @@ Outputs:
   McpServerUrl:
     Description: Paste into claude.ai > Settings > Connectors > Add custom connector
     Value: !Sub ${McpFunctionUrl.FunctionUrl}mcp
+  ArchiveBucket:
+    Description: S3 bucket with the archived (removed) workouts
+    Value: !Ref ArchiveBucket

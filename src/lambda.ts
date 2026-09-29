@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { GetParametersCommand, SSMClient } from "@aws-sdk/client-ssm";
 import serverless from "serverless-http";
+import { S3Archive } from "./archive.js";
 import { createHttpApp, parseAllowedEmails, redirectUrisFromEnv } from "./http.js";
 
 // AWS Lambda entry point, bundled by scripts/build-lambda.mjs and deployed with template.yaml.
@@ -21,7 +22,10 @@ const settings = Object.fromEntries(
   Parameters.map((parameter) => [parameter.Name!.slice(prefix.length + 1), parameter.Value!])
 ) as Record<SettingName, string>;
 
+const archiveBucket = process.env.ARCHIVE_BUCKET!;
 const app = createHttpApp({
+  archive: (email) => new S3Archive(archiveBucket, email),
+  archiveDays: Number(process.env.ARCHIVE_DAYS),
   allowedEmails: parseAllowedEmails(settings.ALLOWED_EMAILS),
   signingSecret: settings.MCP_SIGNING_SECRET,
   redirectUris: redirectUrisFromEnv(process.env.OAUTH_REDIRECT_URIS),

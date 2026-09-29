@@ -1,7 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ExrClient } from "../exr.js";
-import { convertSteps, describeWorkout, workoutFile, type Step } from "../workout.js";
+import type { ArchivedWorkout, WorkoutArchive } from "../archive.js";
+import type { ExrClient, WorkoutListing } from "../exr.js";
+import { convertSteps, describeWorkout, isCreatedHere, workoutFile, type Step } from "../workout.js";
 
 // intervals.icu workout_doc steps. Their other fields (warmup, text, hr, ...) are accepted and ignored.
 const target = z.object({
@@ -30,7 +31,7 @@ const textResult = (value: unknown) => ({ content: [{ type: "text" as const, tex
 
 const utcToday = () => new Date().toISOString().slice(0, 10);
 
-export function registerWorkoutTools(server: McpServer, client: ExrClient) {
+export function registerWorkoutTools(server: McpServer, client: ExrClient, archive: WorkoutArchive, archiveDays: number) {
   server.registerTool(
     "create_workout",
     {
@@ -94,16 +95,92 @@ export function registerWorkoutTools(server: McpServer, client: ExrClient) {
   );
 
   server.registerTool(
-    "delete_workouts",
+    "archive_workouts",
     {
-      title: "Delete EXR workouts",
-      description: "Permanently deletes custom workouts from the user's EXR account. EXR has no undo.",
-      inputSchema: { ids: z.array(workoutId).min(1).max(50).describe("IDs of the workouts to delete, from list_workouts") },
+      title: "Archive EXR workouts",
+      description:
+        "Removes workouts from the user's EXR account reversibly, e.g. superseded daily rows. " +
+        "Before removing anything, the server saves a complete copy of each workout (title, description, " +
+        "every block with its power target and stroke rate) to its archive; if saving a copy fails, " +
+        `nothing is removed. Archived workouts can be put back with restore_workout for ${archiveDays} days, ` +
+        "after which the server purges them automatically. " +
+        "Only workouts created through this connector can be removed; others (such as ones made in EXR) " +
+        "are left alone and reported.",
+      inputSchema: { ids: z.array(workoutId).min(1).max(50).describe("IDs of the workouts to archive, from list_workouts") },
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ ids }) => {
-      const { deleted, notFound } = await client.deleteWorkouts(ids);
-      return textResult({ deleted, ...(notFound.length > 0 ? { not_found: notFound } : {}) });
+      const listing = new Map((await client.listWorkouts()).map((workout) => [workout.id, workout]));
+      const found = [...new Set(ids)].filter((id) => listing.has(id));
+      const copies: ArchivedWorkout[] = [];
+      const notCreatedHere: WorkoutListing[] = [];
+      for (const id of found) {
+        const file = await client.downloadWorkout(id);
+        if (isCreatedHere(file)) copies.push({ ...listing.get(id)!, archivedAt: new Date().toISOString(), file });
+        else notCreatedHere.push(listing.get(id)!);
+      }
+      // Every copy is saved before anything is removed, so a failed save removes nothing
+      await Promise.all(copies.map((copy) => archive.put(copy)));
+      const { deleted } = copies.length > 0 ? await client.deleteWorkouts(copies.map((copy) => copy.id)) : { deleted: [] };
+
+      const notFound = ids.filter((id) => !listing.has(id));
+      return textResult({
+        archived: deleted,
+        ...(deleted.length > 0 ? { restorable_until: addDays(utcToday(), archiveDays) } : {}),
+        ...(notCreatedHere.length > 0
+          ? { not_created_here: notCreatedHere, note: "Workouts not created through this connector can only be removed on the EXR website." }
+          : {}),
+        ...(notFound.length > 0 ? { not_found: notFound } : {}),
+      });
+    }
+  );
+
+  server.registerTool(
+    "list_archived_workouts",
+    {
+      title: "List archived EXR workouts",
+      description:
+        "Lists the workouts removed with archive_workouts that can still be restored, newest first, " +
+        `with the date until which each can be restored (${archiveDays} days after archiving). ` +
+        "A restored workout stays listed here until it's purged.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async () => {
+      const workouts = (await archive.list()).map(({ id, title, description, length, archivedAt }) => ({
+        id,
+        title,
+        description,
+        length,
+        archived_at: archivedAt,
+        restorable_until: addDays(archivedAt.slice(0, 10), archiveDays),
+      }));
+      return textResult(workouts.length > 0 ? { archived: workouts } : { archived: workouts, note: "The archive is empty." });
+    }
+  );
+
+  server.registerTool(
+    "restore_workout",
+    {
+      title: "Restore EXR workout",
+      description:
+        "Puts an archived workout back into the user's EXR account, unchanged, as a new workout with a new ID. " +
+        "The archive keeps its copy until it's purged.",
+      inputSchema: { id: workoutId.describe("The archived workout's ID, from archive_workouts or list_archived_workouts") },
+      annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ id }) => {
+      const workout = await archive.get(id);
+      if (!workout) throw new Error(`No archived workout ${id}. It may have been purged; list_archived_workouts shows what can be restored.`);
+      const newId = await client.uploadWorkout(workout.file);
+      return textResult({
+        id: newId,
+        restored_from: id,
+        ...describeWorkout(workout.file.data),
+        next: "Restart the EXR app to find it under Training Mode > My Workouts.",
+      });
     }
   );
 }
+
+const addDays = (date: string, days: number) => new Date(Date.parse(date) + days * 86_400_000).toISOString().slice(0, 10);

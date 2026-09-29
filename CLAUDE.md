@@ -25,10 +25,12 @@ src/
 ├── oauth.ts          # OAuth server for Claude; sign-in page takes the EXR email + password (stateless, sealed tokens)
 ├── seal.ts           # AES-256-GCM sealing of token claims
 ├── exr.ts            # EXR website client: sign in, list, download, upload, delete
-├── workout.ts        # EXR workout file format; intervals.icu steps → EXR blocks; summaries
-├── server.ts         # createMcpServer(client): registers tools, server instructions
+├── workout.ts        # EXR workout file format; intervals.icu steps → EXR blocks; guid mark; summaries
+├── archive.ts        # S3 archive of removed workouts, per EXR account
+├── server.ts         # createMcpServer(client, archive, days): registers tools, server instructions
 └── tools/
-    └── workouts.ts   # create_workout, list_workouts, get_workout, delete_workouts
+    └── workouts.ts   # create_workout, list_workouts, get_workout, archive_workouts,
+                      # list_archived_workouts, restore_workout
 scripts/
 ├── build-lambda.mjs  # esbuild bundle → dist-lambda/index.mjs
 └── admin.mjs         # npm run admin: allowlist and signing secret in SSM; recycles the Lambda
@@ -94,6 +96,18 @@ Input is intervals.icu `workout_doc.steps`, passed unchanged. Unknown fields (`w
 - `cadence` becomes `strokesPerMin` (the midpoint of a range, rounded).
 - The result's `notes` say which approximations were made, so Claude can tell the user.
 
+## Removing workouts (soft delete)
+
+Claude in claude.ai won't call a tool that permanently deletes data in someone's account, even when asked. It will call one whose removal can be undone. So there's no delete tool. Instead, `archive_workouts` removes workouts reversibly:
+
+- **Archive first:** it downloads each workout and saves the complete EXR file to S3 (`archive/<encoded email>/<workout ID>.json`, with the listing and `archivedAt`). It only asks EXR to delete once every copy is saved. A failed save removes nothing.
+- **Restore:** `restore_workout` uploads the archived file unchanged, so EXR gives it a new ID. The archive keeps its copy until it's purged. `list_archived_workouts` shows what can be restored, and until when.
+- **Purge:** only the bucket's lifecycle rule purges, `ArchiveDays` after archiving. That's 5 days by default, and `ARCHIVE_DAYS` passes the value to the tool descriptions. S3 rounds expiry up to the next midnight UTC. The function's role can put, get and list objects but not delete them, and no tool purges. The bucket is kept when the stack is deleted (`DeletionPolicy: Retain`).
+- **Scoping:** only workouts created through the connector can be removed, so hand-made ones like "My Training" are safe.
+  - `workoutFile` gives each file a `metaData.guid` whose last 12 hex digits are a SHA-256 of `exr-mcp:` plus the rest. It's still a valid v4 UUID, and EXR keeps the guid as uploaded. `isCreatedHere` checks the mark after download.
+  - Workouts created before the mark existed (2026-09-29) aren't marked and can only be removed on the website.
+- The tool descriptions say all this, because Claude decides whether to call a tool from its description.
+
 ## Remote Hosting (AWS Lambda)
 
 Setup and day-to-day commands are in README.md. Design notes and gotchas:
@@ -109,9 +123,10 @@ Setup and day-to-day commands are in README.md. Design notes and gotchas:
 - **Sign-out:** tokens carry the email, which is checked against the allowlist on every use, so `admin deny` signs someone out. `sign-out-all` rotates the signing secret.
 - **Origin:** OAuth metadata needs absolute URLs, but a Lambda can't know its Function URL at deploy time. `http.ts` takes the origin from the `Host` header, only when it matches `*.lambda-url.*.on.aws`; `PUBLIC_URL` overrides this. Routes are built lazily, which is why the rate limiters have `creationStack` validation off.
 - **serverless-http + MCP SDK:** the SDK's transport reads `req.rawHeaders`, which serverless-http leaves empty. `lambda.ts` rebuilds them; without that every MCP call fails with "Not Acceptable".
-- **Stateless MCP:** a new `McpServer`, transport and `ExrClient` per request (`sessionIdGenerator: undefined`, `enableJsonResponse: true`). GET and DELETE on `/mcp` return 405.
+- **Stateless MCP:** a new `McpServer`, transport, `ExrClient` and archive (scoped to the token's email) per request (`sessionIdGenerator: undefined`, `enableJsonResponse: true`). GET and DELETE on `/mcp` return 405.
 - **Settings:** two SecureStrings under `/exr-mcp/`: `MCP_SIGNING_SECRET` and `ALLOWED_EMAILS` (a JSON array). They're read once per cold start; a missing one fails the cold start. `scripts/admin.mjs` recycles the function after each change.
-- **Deploy:** `sam deploy` zips `dist-lambda/` as-is. Don't run `sam build`. `@aws-sdk/*` is external in the bundle because the Node.js runtime provides it.
+- **Archive bucket:** created by the stack, name in the `ArchiveBucket` output and the function's `ARCHIVE_BUCKET` variable.
+- **Deploy:** `sam deploy` zips `dist-lambda/` as-is. Don't run `sam build`. `@aws-sdk/*` is external in the bundle because the Node.js runtime provides it. `@aws-sdk/client-s3` is still a dependency, for local runs.
 
 ## Testing
 
@@ -120,6 +135,7 @@ No test framework in the repo. What worked while building it (scripts kept outsi
 - A real EXR account in `.env` (`EXR_EMAIL`, `EXR_PASSWORD`; only test scripts read them). Name test workouts "ZZ MCP test …" and delete them afterwards.
 - Import `dist/http.js`, start the app on localhost with the account's email in `allowedEmails`, and drive the whole flow with fetch: register, authorize, `POST /login` (also a disallowed email and a wrong password), token (PKCE), MCP `initialize`, `tools/list`, `tools/call` for every tool, then refresh.
 - For the Lambda bundle, run `dist-lambda/index.mjs` with `node --import` and a `module.register` hook that swaps `@aws-sdk/client-ssm` for a stub. Then feed the handler Function URL (payload v2) events with a `*.lambda-url.*.on.aws` Host header.
+- For archive logic without touching EXR: connect `createMcpServer` from `dist/server.js` to an MCP `Client` over `InMemoryTransport`, with a fake client (`listWorkouts`, `downloadWorkout`, `deleteWorkouts`, `uploadWorkout`) and a Map-backed archive. Log the call order to check that every copy is saved before the delete.
 - `sam validate --lint` checks the template.
 
 ## Development Notes

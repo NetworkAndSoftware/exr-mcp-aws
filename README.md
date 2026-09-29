@@ -6,7 +6,7 @@ It's meant for a training coach in Claude that plans workouts in [intervals.icu]
 
 - "Put today's row into EXR."
 - "Create the EXR workouts for this week's planned rows."
-- "Which custom workouts do I have in EXR? Delete the ones from last month."
+- "Which custom workouts do I have in EXR? Remove the rows from before today."
 
 ## Tools
 
@@ -15,9 +15,13 @@ It's meant for a training coach in Claude that plans workouts in [intervals.icu]
 | `create_workout` | Creates a workout from steps in intervals.icu's `workout_doc` format, with the date in front of the title. `dry_run` previews the blocks without creating anything. |
 | `list_workouts` | The custom workouts in the EXR account, newest first: ID, title, description and total length. |
 | `get_workout` | One workout, block by block: length, power target in % of FTP (or free row) and stroke rate. |
-| `delete_workouts` | Deletes workouts. EXR has no undo. |
+| `archive_workouts` | Removes workouts from EXR, reversibly: it first saves a complete copy of each to the server's archive, and removes nothing if that fails. Only removes workouts created through this server, so ones made in EXR are safe. |
+| `list_archived_workouts` | The archived workouts that can still be restored, and until when. |
+| `restore_workout` | Puts an archived workout back into EXR. |
 
 New workouts show up in the EXR app after a restart, under **Training Mode → My Workouts**.
+
+Archived workouts can be restored for 5 days (the `ArchiveDays` parameter in `template.yaml`). After that, an S3 lifecycle rule purges them. No tool can purge the archive, and the server itself has no permission to delete from it.
 
 ### From intervals.icu to EXR
 
@@ -88,7 +92,7 @@ Each person sees only their own EXR workouts.
 | Stop someone connecting (signs them out) | `npm run admin -- deny <email>` |
 | Sign everyone out | `npm run admin -- sign-out-all` |
 | Show the URL | `sam list stack-outputs` |
-| Remove everything | `sam delete`, then `aws ssm delete-parameters --names /exr-mcp/MCP_SIGNING_SECRET /exr-mcp/ALLOWED_EMAILS` |
+| Remove everything | `sam delete`, then `aws ssm delete-parameters --names /exr-mcp/MCP_SIGNING_SECRET /exr-mcp/ALLOWED_EMAILS`, then delete the archive bucket (`sam delete` keeps it): `aws s3 rb s3://<ArchiveBucket> --force` |
 
 Lambda reads its settings once per cold start, so every `admin` change also replaces the function's running instances. That way changes take effect immediately.
 
@@ -97,14 +101,16 @@ Lambda reads its settings once per cold start, so every `admin` change also repl
 - **EXR:** EXR has no API, so the server uses the same pages and forms as a browser on the EXR website's [Custom workouts](https://account.exrgame.com/trainings) page: it uploads, downloads and deletes workout files there.
 - **Sign-in:** claude.ai custom connectors only support OAuth, so the server is a small OAuth server with its own sign-in page. It checks the email against the allowlist, then signs in to EXR with the email and password. The password goes to EXR only; the server keeps nothing but EXR's "remember me" cookie.
 - **Tokens:** Claude's access and refresh tokens carry that cookie, encrypted (AES-256-GCM) with a key only the server has. Every hour Claude refreshes its token, and the server checks that EXR still accepts the cookie. If it doesn't, Claude asks you to connect again.
-- **No database:** nothing is stored per person. The signing secret and the allowlist are SecureString parameters in SSM Parameter Store, so they never appear in the function's configuration or in the repo.
+- **Archive:** removed workouts are kept as JSON files in a private S3 bucket, one folder per EXR account, until the lifecycle rule purges them.
+- **Only its own workouts:** the server marks the workouts it creates in a hidden ID inside the workout file, and only removes workouts that carry that mark.
+- **No database:** apart from the archive, nothing is stored per person. The signing secret and the allowlist are SecureString parameters in SSM Parameter Store, so they never appear in the function's configuration or in the repo.
 - **Cost:** normally $0, within Lambda's always-free allowance (1M requests and 400,000 GB-seconds a month). Set up an AWS budget alert anyway.
 
 ## Running locally
 
 For testing, or for MCP clients on your own machine, the same server runs locally with settings from `.env`:
 
-1. Copy `.env.example` to `.env` and fill it in.
+1. Copy `.env.example` to `.env` and fill it in. The archive needs an S3 bucket, such as the deployed stack's `ArchiveBucket` output, and AWS credentials that can write to it.
 2. Run:
    ```bash
    npm run build
